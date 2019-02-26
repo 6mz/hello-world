@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Fri Jan 18 12:48:30 2019
-
-@author: zWX618024
-"""
-
 from __future__ import division
 import os, time, scipy.io
 import tensorflow as tf
