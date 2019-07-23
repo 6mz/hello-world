@@ -1134,3 +1134,90 @@ def PICNN_V1_4(input,frm_num,reuse=False):  # Unet  use 4 images to test
         out=slim.conv2d(n_final,4,[3,3],stride=1,padding='SAME',activation_fn=None,scope='layer41',reuse=reuse)
         #print(out.shape,'out')
         return out
+		
+def convblock(x, nc, k=3, stride=1, name="convblock"):
+    reuse = False
+    conv_all = []
+    for num in range(x.shape[-1]):
+        conv_tmp = slim.conv2d(x[:,:,:,:,num], nc, [k, k], stride=stride, activation_fn=tf.nn.elu, reuse=reuse, scope=name)
+        reuse = True
+        conv_all.append(conv_tmp)
+    conv_all = tf.stack(conv_all, -1)
+    return conv_all
+
+def maxblock(x):
+    max_pool = tf.reduce_max(x, -1, keep_dims=True)
+    max_pool = tf.tile(max_pool, [1,1,1,1,x.shape[-1]])
+    x = tf.concat([x, max_pool], 3)
+    return x
+
+def deconvblock(x1, x2, out_nc, in_nc, name="deconvblock"):
+
+    x2_shape = tf.shape(x2)
+    deconv_filter = tf.get_variable(name=name, shape=[4, 4, out_nc, in_nc], initializer=tf.contrib.layers.xavier_initializer())
+
+    conv_all = []
+    for num in range(x1.shape[-1]):
+        deconv = tf.nn.conv2d_transpose(x1[:,:,:,:,num], deconv_filter, [x2_shape[0], x2_shape[1], x2_shape[2], out_nc], strides=[1, 2, 2, 1])
+        conv_all.append(deconv)
+    conv_all = tf.stack(conv_all, -1)
+    return conv_all
+
+
+def PICNN_V1_5(input, frm_num=4, reuse=False):
+
+    with tf.variable_scope("generator", reuse=reuse) as vs:
+        x = []
+        for num in range(frm_num):
+            x.append(input[:,:,:,num*4:(num+1)*4])
+        x = tf.stack(x, -1)
+
+        conv1 = convblock(x, 64, 3, 1, name='convblock_1')
+        conv1 = maxblock(conv1)
+
+        conv2 = convblock(conv1, 96, 1, 1, name='convblock_2_1')
+        pool2 = convblock(conv2, 96, 4, 2, name='convblock_2_2')
+        pool2 = maxblock(pool2)
+
+        conv3 = convblock(pool2, 128, 1, 1, name='convblock_3_1')
+        pool3 = convblock(conv3, 128, 4, 2, name='convblock_3_2')
+        pool3 = maxblock(pool3)
+
+        conv4 = convblock(pool3, 256, 1, 1, name='convblock_4_1')
+        pool4 = convblock(conv4, 256, 4, 2, name='convblock_4_2')
+        pool4 = maxblock(pool4)
+
+        conv5 = convblock(pool4, 384, 1, 1, name='convblock_5_1')
+        pool5 = convblock(conv5, 384, 4, 2, name='convblock_5_2')
+
+        conv6 = convblock(pool5, 384, 3, 1, name='convblock_6')
+        conv6 = deconvblock(conv6, conv5, 384, 384, name="deconvblock_6")
+        conv6 = maxblock(conv6)
+        conv6 = tf.concat([conv6, conv5], 3)
+
+        conv7 = convblock(conv6, 384, 1, 1, name='convblock_7_1')
+        conv7 = convblock(conv7, 384, 3, 1, name='convblock_7_2')
+        conv7 = deconvblock(conv7, conv4, 256, 384, name="deconvblock_7")
+        conv7 = maxblock(conv7)
+        conv7 = tf.concat([conv7, conv4], 3)
+
+        conv8 = convblock(conv7, 256, 1, 1, name='convblock_8_1')
+        conv8 = convblock(conv8, 256, 3, 1, name='convblock_8_2')
+        conv8 = deconvblock(conv8, conv3, 192, 256, name="deconvblock_8")
+        conv8 = maxblock(conv8)
+        conv8 = tf.concat([conv8, conv3], 3)
+
+        conv9 = convblock(conv8, 192, 1, 1, name='convblock_9_1')
+        conv9 = convblock(conv9, 192, 3, 1, name='convblock_9_2')
+        conv9 = deconvblock(conv9, conv2, 96, 192, name="deconvblock_9")
+        conv9 = maxblock(conv9)
+        conv9 = tf.concat([conv9, conv2], 3)
+
+        conv10 = convblock(conv9, 96, 1, 1, name='convblock_10_1')
+        conv10 = convblock(conv10, 96, 3, 1, name='convblock_10_2')
+        conv10 = tf.reduce_max(conv10, -1)
+
+        out = slim.conv2d(conv10, 64, [3, 3], stride=1, activation_fn=tf.nn.elu, scope='out_1')
+        out = slim.conv2d(out, 4, [3, 3], stride=1, activation_fn=None, scope='out_2')
+
+    return out
