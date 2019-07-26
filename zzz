@@ -1,514 +1,664 @@
 # -*- coding: utf-8 -*-
+split.py
 """
-Created on Tue Feb 26 14:07:01 2019
-
-@author: zWX618024
-"""
-from __future__ import division
-import os, time, scipy.io
-import tensorflow as tf
-import tensorflow.contrib.slim as slim
+import os, time, pickle, random, time
+from datetime import datetime
 import numpy as np
+import math
+from imageio import imwrite
+import utils_align as utils_align
+
 import glob
-from skimage import filters
-import math,cv2
-import tensorlayer as tl
-from model_zcz import *
-from pre_funs import prep_np,save_test
-
-flags = tf.flags
-FLAGS = flags.FLAGS
-flags.DEFINE_string('tmp_res_dir', './picnn_blur_denoise/tmp/0618/1/', 'the tmp result during training ')
-
-#ps = 256  # patch size for training  512
-frm_num=6 #
+import cv2
 
 def create_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-def parse_example(example_proto):
-    dics = {}
-    # dics['label'] = tf.FixedLenFeature(shape=[],dtype=tf.int64)
-    dics['clean_img'] = tf.FixedLenFeature(shape=[],dtype=tf.string)
-    dics['shape'] = tf.FixedLenFeature(shape=[2], dtype=tf.int64)
-    dics['img_num'] = tf.FixedLenFeature(shape=[1], dtype=tf.int64)
-    parsed_example = tf.parse_single_example(serialized=example_proto,features=dics)
+def analyse_raw_name(raw_name):
+    raw_items = os.path.basename(raw_name).split("_")
+    for i in range(len(raw_items)):
+        if "ISO" == raw_items[i]:
+            iso = int(raw_items[i+1])
+    return iso
 
-    clean_img = parsed_example['clean_img']
-    clean_img = tf.decode_raw(clean_img, tf.uint16)
+def analyse_ce_raw_name(raw_name):
+    raw_items = os.path.basename(raw_name).split("_")
+    iso = int(raw_items[5])
 
-    clean_img = tf.reshape(clean_img, [300, 300, 4])
-    #shape = parsed_example['shape']
-    #img_num = parsed_example['img_num']
-
-    return clean_img
+    return iso
 
 
 
-def parse_psf(psf_proto):
-    dics = {}
-    # dics['label'] = tf.FixedLenFeature(shape=[],dtype=tf.int64)
-    dics['psf'] = tf.FixedLenFeature(shape=[],dtype=tf.string)
-    dics['shape'] = tf.FixedLenFeature(shape=[2], dtype=tf.int64)
-    dics['psf_num'] = tf.FixedLenFeature(shape=[1], dtype=tf.int64)
-    parsed_psf = tf.parse_single_example(serialized=psf_proto,features=dics)
+def read_vogue_raw(raw_file, size):
+    raw = np.fromfile(raw_file, dtype=np.uint16)
+    raw = raw.reshape(size)
+    
+    #raw = raw_file
+    row_num = raw.shape[0]
+    column_num = raw.shape[1]
 
-    psf = parsed_psf['psf']
-    psf = tf.decode_raw(psf, tf.float64)
+    img_b = raw[0:row_num:2, 0:column_num:2]
+    img_gb = raw[0:row_num:2, 1:column_num:2]
+    img_gr = raw[1:row_num:2, 0:column_num:2]
+    img_r = raw[1:row_num:2, 1:column_num:2]
 
-    psf = tf.reshape(psf, [32,32])#64,64
-    #shape = parsed_example['shape']
-    #img_num = parsed_example['img_num']
+    img_test = np.stack([img_b, img_gb, img_gr, img_r], axis=-1)
 
-    return psf
+    img_test = img_test / 1023.
+
+    return img_test
+
+def read_simple_raw(raw_file,size):
+    raw = np.fromfile(raw_file,dtype=np.uint16)
+    raw = raw.reshape(size)
+    raw = raw / 1023.
+    return raw
 
 
+def crop_raw(raw,row,col):
+    crop = raw[150:150+row-1,150:150+col-1]
+    return crop
 
-def noise_profile_v2(iso):
-    paralist=[(0.00000009, 0.00130705, 0.00026902, -0.20318409), (0.00000013, 0.00013817, 0.00024098, 0.01151728)]
-    if iso > 5000:
-        index = 0
+def calc_matrix(img1, img2):
+    #first, find the sift features in images and apply the ratio test to find the best matches
+    MIN_MATCH_COUNT = 10
+    sift = cv2.xfeatures2d.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(img1,None)
+    kp2, des2 = sift.detectAndCompute(img2,None)
+    FLANN_INDEX_KDTREE = 0
+    index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
+    search_params = dict(check = 50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    matchs = flann.knnMatch(des1,des2,k=2)	
+    good = []
+    for m,n in matchs:
+    	if m.distance < 0.7*n.distance:
+    		good.append(m)
+    	
+    #extract the locations of matched keypoints in both the images, and get the 3*3 transformation matrix
+    if len(good)>MIN_MATCH_COUNT:
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
+        #return M
     else:
-        index = 1
-    (B_A, B_B, K_A, K_B) = paralist[index]
-
-    #affine variance model
-    b = (-(K_A * iso + K_B)* 16.0 + (B_A * math.pow(iso, 2) + B_B * iso)) / (255.0 * 255.0)
-    a = (K_A * iso + K_B) / 255.0
-    return a,b
-
-def noise_profile_v2_voga(iso):
-    paralist=[(0.00000020,0.00015192,0.00023078,0.00595555)]
-    index = 0
-    (B_A, B_B, K_A, K_B) = paralist[index]
+        M = np.diag(np.diag(np.ones([3,3])))
+    return M
     
-    #affine variance model
-    b = (-(K_A * iso + K_B)* 16.0 + (B_A * math.pow(iso, 2) + B_B * iso)) / (255.0 * 255.0)
-    a = (K_A * iso + K_B) / 255.0
-    return a,b
-
-#run vst
-def vst_f(a,b,raw):
-    #vst
-    sigma = math.sqrt(max(b, 0.0))
-    g = max(-b, 0.0)/a
-    t0 = a*a * 3.0 / 8.0 + sigma*sigma - a*g
-    dst_raw = 2.0*tf.sqrt(tf.maximum(raw*a+t0,0))/a
-
-    return dst_raw
-
-def inv_vst_f_n(a,b,raw):
-    sigma = math.sqrt(max(b, 0))
-    g = max(-b, 0) / a
-    sqrt3_2 = math.sqrt(3.0/2.0)
-    raw2 = raw * raw
-    raw3 = raw2*raw
-    dst_raw = raw2 / 4.0 + sqrt3_2 / (raw * 4.0) - 11.0 / (8 * raw2) + 5.0 * sqrt3_2 / (8.0 * raw3) - 1.0 / 8.0 - sigma * sigma / (a * a)
-    dst_raw2 = np.maximum(dst_raw, 0) * a + g
-
-    return dst_raw2
-
-def blur(img,psf):
-    psf_f = tf.Variable(tf.stack([tf.stack([psf,psf,psf,psf],axis=-1)],axis=-1),trainable=False,name="psf")
-    #psf_final = tf.stack([psf_f],axis=-1)
-    blur_img = tf.nn.depthwise_conv2d(img,psf_f,[1,1,1,1],padding='SAME')
-    blur_img = tf.image.resize_image_with_crop_or_pad(blur_img,118,118)#134
-    #mosiac
-    blur_b = blur_img[:,0:118:2,0:118:2,0]#59*59#134*134
-    blur_g1 = blur_img[:,0:118:2,1:118:2,1]
-    blur_g2 = blur_img[:,1:118:2,0:118:2,2]#134*134
-    blur_r = blur_img[:,1:118:2,1:118:2,3]
-
-    blur_img = tf.stack((blur_b,blur_g1,blur_g2,blur_r),axis=-1)#59,59,4    
+def regis(raw,raw_tmp,shape):
+    homo = calc_matrix(raw_tmp,raw)  #we need to warp raw_tmp to the position of raw
+    raw_tmp = cv2.warpPerspective(raw_tmp,homo,shape,cv2.INTER_LINEAR,cv2.BORDER_REPLICATE)
+    return raw_tmp
     
-    return blur_img
+#10bit
+def save_10bit_raw(input, path, size):
+    row_num = size[0]
+    column_num = size[1]
+    rst_raw = np.ndarray(shape=size, dtype=np.float32)
+    #print(rst_raw.shape)
+    rst_raw[1:row_num:2, 1:column_num:2] = input[ :, :, 3]
+    rst_raw[1:row_num:2, 0:column_num:2] = input[ :, :, 2]
+    rst_raw[0:row_num:2, 1:column_num:2] = input[ :, :, 1]
+    rst_raw[0:row_num:2, 0:column_num:2] = input[ :, :, 0]
+    rst_raw = rst_raw * 1023
 
-def save_img(raw, dir, name):
-    t_raw = np.clip(raw, 0, 1)
-    t_raw = t_raw * 255 * 2
-    t_raw = np.clip(t_raw, 0, 255).astype(np.uint8)
-    for j in range(4):
-        cv2.imwrite(dir + '/%s_%d.png' % (name, j), t_raw[:, :, j])
+    rst_raw = np.where(rst_raw > 1023, 1023, rst_raw)
+    rst_raw = rst_raw.astype(np.uint16)
+    rst_raw.tofile(path)
+
+    return 0
+
+#10bit
+def save_10bit_simple(input, path, size):
+    #row_num = size[0]
+    #column_num = size[1]
+    rst_raw = np.ndarray(shape=size, dtype=np.float32)
+    rst_raw = input * 1023.
+    rst_raw = np.where(rst_raw > 1023, 1023, rst_raw)
+    rst_raw = rst_raw.astype(np.uint16)
+    rst_raw.tofile(path)
+
+    return 0
 
 
-# save the tmp image during training
-def save_tmp_res(tmp_in, tmp_gt, tmp_res, dirr):
-    a, b = noise_profile_v2(25600)
-    tmp_in = inv_vst_f_n(a,b,tmp_in)
-    tmp_gt = inv_vst_f_n(a,b,tmp_gt)
-    tmp_res = inv_vst_f_n(a,b,tmp_res)
-    frame_num = frm_num
-    for jj in range(frame_num):
-        raw_tmp = tmp_in[:, :, 4*jj:4*jj+4]
-        save_img(raw_tmp, dirr, 'noisy_%d' % jj)
-    save_img(tmp_gt, dirr, 'gt')
-    save_img(tmp_res, dirr, 'net_out')
 
+def evaluate_net_v2(src_path, result_raw_path, folder_depth, test_items):
 
-def preprocess(clean_img, bit_depth, iso, frm_num,psf):
-    # a, b = new_noise_profile(iso)
-    # max_v = new_cal_max_v(a, b)
+    # size= (2976, 3968)
+    size = (2736, 3648)
+    #size = (3648,2736)
+    shape = (1824, 1368)
 
-    # iso_index = tf.random_uniform(shape=[1], minval=0, maxval=2, dtype=tf.int32)
-    # a, b = noise_profile_v2(tf.convert_to_tensor(iso_list)[iso_index])
-    a, b = noise_profile_v2_voga(iso)
-    #ds_size = 300#1100
-    #clean_img = tf.random_crop(clean_img, [tf.shape(clean_img)[0], ds_size, ds_size, 4])
-    clean_img = tf.cond(tf.greater(tf.random_normal([1])[0], 0), lambda: tf.transpose(clean_img,[0,2,1,3]), lambda: clean_img)
-    clean_img = tf.cond(tf.greater(tf.random_normal([1])[0], 0), lambda: tf.reverse(clean_img,axis=[1]), lambda: clean_img) #verticle flipping
-    clean_img = tf.cond(tf.greater(tf.random_normal([1])[0], 0), lambda: tf.reverse(clean_img,axis=[2]), lambda: clean_img)#herizontal flipping
-    #clean_img = tf.image.random_flip_left_right(clean_img)
-    #clean_img = tf.image.random_flip_up_down(clean_img)
-    
-    clean_img = tf.cast(clean_img, tf.float32)
-    psf = tf.cast(psf,tf.float32)
-    # blc = pow(2, bit_depth - 4)
-    # clean_img = clean_img-blc
-    zeros = tf.zeros(tf.shape(clean_img), tf.float32)
-    clean_img = tf.where(tf.greater(clean_img, zeros), clean_img, zeros)
+    src_folder_list = []
+    dst_raw_path_list = []
+    # for depth in folder_depth_list:
+    #     tmp = sorted(glob.glob(src_path + "*/"*depth + "data_noise"))
+    #     folder_list.extend(tmp)
+
+    # test data bench mark
+    for item in test_items:
+        tmp = sorted(glob.glob(src_path + item + "*/"*folder_depth))
+        src_folder_list.extend(tmp)
+    for i in range(len(src_folder_list)):
+        dst_raw_path_list.append(result_raw_path + src_folder_list[i][len(src_path):])
+
+    reuse_flag = False
+
+    loaded = False
+    for i in range(len(src_folder_list)):
+        print(src_folder_list[i])
+        raw_files = glob.glob(src_folder_list[i] + '*.raw')
+        raw_files.sort()
+        raw_name = raw_files[0].split('/')[-1]
+        prefix = raw_name.split('_')[0]
         
-    clean_img = clean_img / float(pow(2, bit_depth) - 1)
-    '''
-    clean_img_1_0 = (clean_img[:,0:ds_size:2,0:ds_size:2,0]+clean_img[:,0:ds_size:2,1:ds_size:2,0]+clean_img[:,1:ds_size:2,0:ds_size:2,0]+clean_img[:,1:ds_size:2,1:ds_size:2,0])/4.0  #150*150
-    clean_img_1_1 = (clean_img[:,0:ds_size:2,0:ds_size:2,1]+clean_img[:,0:ds_size:2,1:ds_size:2,1]+clean_img[:,1:ds_size:2,0:ds_size:2,1]+clean_img[:,1:ds_size:2,1:ds_size:2,1])/4.0   #150*150
-    clean_img_1_2 = (clean_img[:,0:ds_size:2,0:ds_size:2,2]+clean_img[:,0:ds_size:2,1:ds_size:2,2]+clean_img[:,1:ds_size:2,0:ds_size:2,2]+clean_img[:,1:ds_size:2,1:ds_size:2,2])/4.0#
-    clean_img_1_3 = (clean_img[:,0:ds_size:2,0:ds_size:2,3]+clean_img[:,0:ds_size:2,1:ds_size:2,3]+clean_img[:,1:ds_size:2,0:ds_size:2,3]+clean_img[:,1:ds_size:2,1:ds_size:2,3])/4.0
-    
-    #clean_img_g = (clean_img_1_1+clean_img_1_2)/2.0#150*150
-    clean_img_1 = tf.stack((clean_img_1_0,clean_img_1_1,clean_img_1_2,clean_img_1_3),axis=-1)#150,150,3 #realistic photon   
-    '''
-    clean_img_1 = slim.avg_pool2d(clean_img, [2, 2], padding='SAME')#150
-    clean_img_crop = tf.image.resize_image_with_crop_or_pad(clean_img_1,118,118)
-    
-    #gt mosiac
-    clean_b = clean_img_crop[:,0:118:2,0:118:2,0]#59*59#67
-    clean_g1 = clean_img_crop[:,0:118:2,1:118:2,1]
-    clean_g2 = clean_img_crop[:,1:118:2,0:118:2,2]
-    clean_r = clean_img_crop[:,1:118:2,1:118:2,3] 
-    
-    
-    clean_img_2 =  tf.stack((clean_b,clean_g1,clean_g2,clean_r),axis=-1)   
-    vst_clean = vst_f(a, b, clean_img_2)
-    blur_clean = blur(clean_img_1,psf[0])
-    # add noise to vst img
-    vst_clean_blur = vst_f(a, b, blur_clean)
+        create_dir(dst_raw_path_list[i])
+        dst_raw_name = dst_raw_path_list[i] + prefix + '_' + raw_name[len(prefix):]
 
-    n = tf.random_normal(shape=tf.shape(vst_clean), stddev=1.0, name="noise_0")
-    vst_noise_data = vst_clean_blur + n
-    avg = vst_noise_data
-
-    for i in range(frm_num-1): 
-        blur_tmp=blur(clean_img_1,psf[i+1])#59*59*4
+        frm_num = 4
+        '''
+        orig_raw_0 = read_vogue_raw(raw_files[frm_num-1],size)
+        #print(orig_raw1.shape)
+        save_10bit_raw(orig_raw_0, dst_raw_name, size)
+        imwrite(dst_raw_path_list[i]+'_g_%d.png'% (frm_num-1), orig_raw_0[:,:,2])
+        orig_raw_0 = np.clip(orig_raw_0, 0, 1)
+        orig_raw_0 = orig_raw_0 * 255
+        orig_raw_0 = orig_raw_0.astype(np.uint8)
+        start_time = time.time()
         
-        vst_tmp = vst_f(a,b,blur_tmp)
-        noise_tmp = tf.random_normal(shape=tf.shape(vst_clean), stddev=1.0, name="noise_%d"%(i+1))
-        noise_data_tmp = noise_tmp + vst_tmp
-        avg = avg + noise_data_tmp
-        vst_noise_data = tf.concat([vst_noise_data, noise_data_tmp], axis=-1)
-    avg = avg / frm_num
+        for f_tmp in range(0, frm_num-1):
+            orig_raw_tmp = read_vogue_raw(raw_files[f_tmp],size)
+             
+            orig_raw_tmp = np.clip(orig_raw_tmp, 0, 1)
+            orig_raw_tmp = 255*orig_raw_tmp
+            orig_raw_tmp = orig_raw_tmp.astype(np.uint8)
+            #orig_raw_tmp = regis(orig_raw_0, orig_raw_tmp1,size_3)
+            
+            homo = calc_matrix(orig_raw_0*2, orig_raw_tmp*2)  #we need to warp raw_tmp to the position of raw
+            orig_raw_tmp = cv2.warpPerspective(orig_raw_tmp, homo, shape, cv2.INTER_LINEAR, cv2.BORDER_REPLICATE)
+            
+            
+            orig_raw_tmp = orig_raw_tmp/(255.0)
+            raw_name = raw_files[f_tmp+1].split('/')[-1]
+            prefix = raw_name.split('_')[0]
+            dst_raw_name = dst_raw_path_list[i] + prefix + '_' + raw_name[len(prefix):]
+            save_10bit_raw(orig_raw_tmp, dst_raw_name, size)
+            imwrite(dst_raw_path_list[i]+'_g_%d.png'% f_tmp, orig_raw_tmp[:,:,2])
+            print(orig_raw_tmp.shape)
 
-    return vst_noise_data, vst_clean, avg
-
-
-
-
-def gl_loss(img1,img2):
-        # total variation denoising
-        shape = tuple(img1.get_shape().as_list())
-        #gl_y_size = _tensor_size(image[:,1:,:,:])
-        #gl_x_size = _tensor_size(image[:,:,1:,:])
+            print("process folder:%s" % src_folder_list[i])
+            print("took: %4.4fs" % (time.time() - start_time))
+            '''
+        MOTION_MODEL = 'ECC'
+        orig_raw = []
+        orig_raw_G = []
+        for f_tmp in range(0, frm_num):
+            orig_raw_tmp = read_vogue_raw(raw_files[f_tmp],size)
+            orig_raw_tmp = 255*orig_raw_tmp
+            orig_raw_tmp = orig_raw_tmp.astype(np.uint8)
+            orig_raw.append(orig_raw_tmp)
+            orig_raw_G.append(orig_raw_tmp[:,:,1]*2)
+        print('Start alignment')
+        start_time = time.time()
+        if MOTION_MODEL == 'ECC':
+            t, t_inv, valid_id = utils_align.align_ecc(orig_raw, orig_raw_G, 0, thre=0.3)
+        elif MOTION_MODEL == 'RIGID':
+            t, t_inv, valid_id = utils_align.align_rigid(orig_raw, orig_raw_G, 0, thre=0.2)
+        print("Full alignment: %4.4f" %(time.time() - start_time))
         
-        gl_loss = tf.reduce_mean(tf.abs((img1[:,1:,:,:] - img1[:,:shape[1]-1,:,:])  -(img2[:,1:,:,:] - img2[:,:shape[1]-1,:,:]))) + tf.reduce_mean(tf.abs((img1[:,:,1:,:] - img1[:,:,:shape[2]-1,:])-(img2[:,:,1:,:] - img2[:,:,:shape[2]-1,:])))
-
-        return gl_loss
-
-
-
-
-
-def average_gradients(tower_grads):
-    average_grads = []
-    for grad_and_vars in zip(*tower_grads):
-        grads = []
-        for g, _ in grad_and_vars:
-            expanded_g = tf.expand_dims(g, 0)
-            grads.append(expanded_g)
-        grad = tf.concat(grads, 0)
-        grad = tf.reduce_mean(grad, 0)
-
-        v = grad_and_vars[0][1]
-        grad_and_var = (grad, v)
-        average_grads.append(grad_and_var)
-    return average_grads
-
-
-
-def train(record_list, psf_list,ckpt_dir, log_dir, batch_size=16, lr_init=6e-5, beta1=0.9, gpu_num=1, finetune=False, iter_start=0):
-    dataset = tf.data.TFRecordDataset(filenames=record_list)
-    dataset = dataset.map(parse_example)
-    dataset = dataset.shuffle(1000)
-    dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(batch_size))
-    dataset = dataset.repeat()
-    
-    iterator = dataset.make_one_shot_iterator()
-    clean_img = iterator.get_next()
-    
-    
-    psfset = tf.data.TFRecordDataset(filenames=psf_list)
-    psfset = psfset.map(parse_psf)
-    psfset = psfset.shuffle(1000)
-    psfset = psfset.apply(tf.contrib.data.batch_and_drop_remainder(frm_num))
-    psfset = psfset.repeat()
-    psfiterator = psfset.make_one_shot_iterator()
-    psf = psfiterator.get_next()
-    
-    
-    vst_noise_data, vst_clean, vst_avg = preprocess(clean_img, 14, 25600, frm_num, psf)
-    label_splits = tf.split(vst_clean, gpu_num,axis=0)
-    #label_splits = tf.split(label_splits, 1,axis=-1)
-    data_splits = tf.split(vst_noise_data, gpu_num,axis=0)
-   # data_splits = tf.split(data_splits, frm_num,axis=-1)
- #   vst_avg_splits = tf.split(vst_avg, 1)
-
-    with tf.variable_scope('learning_rate'):
-        lr_v = tf.Variable(lr_init, trainable=False)
-    g_optim_init = tf.train.AdamOptimizer(lr_v, beta1=beta1)
-    global_step = tf.Variable(0, name="global_step", trainable=False)
-
-    reuse = False
-    tower_grads = []
-    loss_list = []
-    
-    
-    with tf.variable_scope(tf.get_variable_scope()) as initScope:
-        for i in range(gpu_num):
-            with tf.device('/gpu:%d' % i):
-                with tf.name_scope('GPU_%d' % i) as scpoe:
-                    #print(data_splits[i].shape,'data_split')
-                    out_image= PICNN_V1_4(tf.split(data_splits[i],frm_num,axis=-1),frm_num,reuse=reuse)
-                    #mse_loss = tl.cost.mean_squared_error(out_image, label_splits[i], is_mean=True)
-                    #tf.get_variable_scope().reuse_variables()
-                    loss_fil=gl_loss(out_image,label_splits[i])
-                    G_loss=tf.reduce_mean(tf.abs(out_image - label_splits[i]))*0.1+ loss_fil#+mse_loss#
-                    tf.get_variable_scope().reuse_variables()
-                    loss_list.append(G_loss)
-                    grads = g_optim_init.compute_gradients(G_loss)
-                    #loss_list.append(mse_loss)
-                    #grads = g_optim_init.compute_gradients(mse_loss)
-                    tower_grads.append(grads)
-                    reuse = True
-    mean_loss = tf.reduce_mean(loss_list)
-    grads = average_gradients(tower_grads)
-    apply_gradient_op = g_optim_init.apply_gradients(grads, global_step=global_step)
-    
-    ''' 
-    ############################# quickly test#######################################
-    raw_files = glob.glob('/DATA1/02.dlnr_test_data/src/08.cbg_sid_dpcc_v2/20180904_170218/' + '*.raw')
-    raw_files.sort()
-    img_test, avg = prep_np(raw_files, iso=24575, size=(2736, 3648))
-    t_image = tf.placeholder('float32', [None, None, None, 24], name='input_image')
-    tf.get_variable_scope().reuse_variables()
-    net_g = PICNN_V1_4(t_image, 4, reuse=True)
-    #################################################################################
-    '''
-
-    saver = tf.train.Saver(max_to_keep=1000 )
-    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True, log_device_placement=False))
-    sess.run(tf.global_variables_initializer())
-    #tl.layers.initialize_global_variables(sess)
-
-    total_loss = 0
-    n_iter = iter_start
-    if finetune == True:
-        saver.restore(sess, ckpt_dir + 'ckpt-' + str(n_iter))
-
-    # summary show in tensorboard
-    # tf.summary.image("label", label_splits[-1][0:1, :, :, 1:2])
-    # tf.summary.image("noide_data", data_splits[-1][0:1, :, :, 1:2])
-    # tf.summary.image("net_out", net_out[0:1, :, :, 1:2])
-    tf.summary.scalar('loss', mean_loss)
-    merged_summary_op = tf.summary.merge_all()
-    summary_writer = tf.summary.FileWriter(log_dir, sess.graph, flush_secs=60)
-
-    start_time = time.time()
-    for i in range(700001):
-        #errM, _ = sess.run([mean_loss, apply_gradient_op])
+        orig_raw = [v.astype(np.float32)/255.0 for v in orig_raw]
+        images_t, t, t_inv = utils_align.apply_transform(orig_raw, t, t_inv, MOTION_MODEL, scale=1)
         
-        if n_iter % 10000 == 1:   #test
-            tmp_gt, tmp_in, tmp_res, errM, _ = sess.run(['split:0', 'split_1:0','GPU_0/PICNN_V1_4/layer41/BiasAdd:0', mean_loss,apply_gradient_op])
-            dirr = FLAGS.tmp_res_dir + 'train_step_%07d' % n_iter
-            create_dir(dirr)
-            save_tmp_res(tmp_in[0, ...], tmp_gt[0, ...], tmp_res[0, ...], dirr)
+        #crop
+        is_crop = False#True
+        if is_crop == True:
+            min_h, max_h, min_w, max_w = 50, size[0]//2-50, 50, size[1]//2-50
+            out_size = (2*(max_h-min_h), 2*(max_w-min_w))
         else:
-            errM, _ = sess.run(
-                [ mean_loss, apply_gradient_op])
-        total_loss += errM
-        '''        
-        if i % 10000 == 0:
-            out_image = sess.run(net_g, {t_image: [img_test]})
-            save_test(out_image, ckpt_dir+"img/%08d_deblur_denoised.png" % n_iter, iso=24575)
-            #save_img(output, gt, ckpt_dir+"img/%08d_denoised_gan.png" % n_iter)
-        '''            
-        if n_iter % 500 == 0:
-            print('every 500 times iteration, the avg mse_loss is %f' %(total_loss/i))
-            saver.save(sess, ckpt_dir+'ckpt', global_step=n_iter)
-        if n_iter % 100 ==0:
-            print("iter: %4d time: %4.4fs, mse: %.8f " % (n_iter, time.time() - start_time, errM))
-            summary_result = sess.run(merged_summary_op)
-            summary_writer.add_summary(summary_result, global_step=n_iter)
-            start_time = time.time()
-        n_iter += 1
-#first change lv to 4e-6, then add mse loss
-
-def train_1(record_list, psf_list,ckpt_dir, log_dir, batch_size=16, lr_init=1e-4, beta1=0.9, gpu_num=1, finetune=False, iter_start=0):
-    dataset = tf.data.TFRecordDataset(filenames=record_list)
-    dataset = dataset.map(parse_example)
-    dataset = dataset.shuffle(1000)
-    dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(batch_size))
-    dataset = dataset.repeat()
-    
-    iterator = dataset.make_one_shot_iterator()
-    clean_img = iterator.get_next()
-    
-    
-    psfset = tf.data.TFRecordDataset(filenames=psf_list)
-    psfset = psfset.map(parse_psf)
-    psfset = psfset.shuffle(1000)
-    psfset = psfset.apply(tf.contrib.data.batch_and_drop_remainder(frm_num))
-    psfset = psfset.repeat()
-    psfiterator = psfset.make_one_shot_iterator()
-    psf = psfiterator.get_next()
-    
-    
-    vst_noise_data, vst_clean, vst_avg = preprocess(clean_img, 14, 25600, frm_num, psf)
-    label_splits = tf.split(vst_clean, gpu_num,axis=0)
-    #label_splits = tf.split(label_splits, 1,axis=-1)
-    data_splits = tf.split(vst_noise_data, gpu_num,axis=0)
-   # data_splits = tf.split(data_splits, frm_num,axis=-1)
- #   vst_avg_splits = tf.split(vst_avg, 1)
-
-    with tf.variable_scope('learning_rate'):
-        lr_v = tf.Variable(lr_init, trainable=False)
-    g_optim_init = tf.train.AdamOptimizer(lr_v, beta1=beta1)
-    global_step = tf.Variable(0, name="global_step", trainable=False)
-
-    reuse = False
-    tower_grads = []
-    loss_list = []
-    
-    
-    with tf.variable_scope(tf.get_variable_scope()) as initScope:
-        for i in range(gpu_num):
-            with tf.device('/gpu:%d' % i):
-                with tf.name_scope('GPU_%d' % i) as scpoe:
-                    #print(data_splits[i].shape,'data_split')
-                    out_image= PICNN_V1_5(data_splits[i],frm_num,reuse=reuse)
-                    #mse_loss = tl.cost.mean_squared_error(out_image, label_splits[i], is_mean=True)
-                    #tf.get_variable_scope().reuse_variables()
-                    loss_fil=gl_loss(out_image,label_splits[i])
-                    G_loss=tf.reduce_mean(tf.abs(out_image - label_splits[i]))*0.1+ loss_fil#+mse_loss#
-                    tf.get_variable_scope().reuse_variables()
-                    loss_list.append(G_loss)
-                    grads = g_optim_init.compute_gradients(G_loss)
-                    #loss_list.append(mse_loss)
-                    #grads = g_optim_init.compute_gradients(mse_loss)
-                    tower_grads.append(grads)
-                    reuse = True
-    mean_loss = tf.reduce_mean(loss_list)
-    grads = average_gradients(tower_grads)
-    apply_gradient_op = g_optim_init.apply_gradients(grads, global_step=global_step)
-    
-    ''' 
-    ############################# quickly test#######################################
-    raw_files = glob.glob('/DATA1/02.dlnr_test_data/src/08.cbg_sid_dpcc_v2/20180904_170218/' + '*.raw')
-    raw_files.sort()
-    img_test, avg = prep_np(raw_files, iso=24575, size=(2736, 3648))
-    t_image = tf.placeholder('float32', [None, None, None, 24], name='input_image')
-    tf.get_variable_scope().reuse_variables()
-    net_g = PICNN_V1_4(t_image, 4, reuse=True)
-    #################################################################################
-    '''
-
-    saver = tf.train.Saver(max_to_keep=1000 )
-    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True, log_device_placement=False))
-    sess.run(tf.global_variables_initializer())
-    #tl.layers.initialize_global_variables(sess)
-
-    total_loss = 0
-    n_iter = iter_start
-    if finetune == True:
-        saver.restore(sess, ckpt_dir + 'ckpt-' + str(n_iter))
-
-    # summary show in tensorboard
-    # tf.summary.image("label", label_splits[-1][0:1, :, :, 1:2])
-    # tf.summary.image("noide_data", data_splits[-1][0:1, :, :, 1:2])
-    # tf.summary.image("net_out", net_out[0:1, :, :, 1:2])
-    tf.summary.scalar('loss', mean_loss)
-    merged_summary_op = tf.summary.merge_all()
-    summary_writer = tf.summary.FileWriter(log_dir, sess.graph, flush_secs=60)
-
-    start_time = time.time()
-    for i in range(1000001):
-        #errM, _ = sess.run([mean_loss, apply_gradient_op])
+            min_h, max_h, min_w, max_w = 0, size[0], 0, size[1]
+            out_size = size
+        ###
+        for f_tmp in range(0, frm_num):
+            img_tmp = images_t[f_tmp]
+            
+            img_tmp = img_tmp[min_h:max_h, min_w:max_w,:]
+            raw_name = raw_files[f_tmp].split('/')[-1]
+            prefix = raw_name.split('_')[0]
+            dst_raw_name = dst_raw_path_list[i] + prefix + '_' + raw_name[len(prefix):]
+            save_10bit_raw(img_tmp, dst_raw_name, out_size)
+            imwrite(dst_raw_path_list[i]+MOTION_MODEL+'_g_%d.png'% f_tmp, img_tmp[:,:,2]*2)
         
-        if n_iter % 10000 == 1:   #test
-            tmp_gt, tmp_in, tmp_res, errM, _ = sess.run(['split:0', 'split_1:0','GPU_0/generator/out_2/BiasAdd:0', mean_loss,apply_gradient_op])
-            dirr = FLAGS.tmp_res_dir + 'train_step_%07d' % n_iter
-            create_dir(dirr)
-            save_tmp_res(tmp_in[0, ...], tmp_gt[0, ...], tmp_res[0, ...], dirr)
-        else:
-            errM, _ = sess.run(
-                [ mean_loss, apply_gradient_op])
-        total_loss += errM
-        '''        
-        if i % 10000 == 0:
-            out_image = sess.run(net_g, {t_image: [img_test]})
-            save_test(out_image, ckpt_dir+"img/%08d_deblur_denoised.png" % n_iter, iso=24575)
-            #save_img(output, gt, ckpt_dir+"img/%08d_denoised_gan.png" % n_iter)
-        '''            
-        if n_iter % 500 == 0:
-            print('every 500 times iteration, the avg mse_loss is %f' %(total_loss/i))
-            saver.save(sess, ckpt_dir+'ckpt', global_step=n_iter)
-        if n_iter % 100 ==0:
-            print("iter: %4d time: %4.4fs, mse: %.8f " % (n_iter, time.time() - start_time, errM))
-            summary_result = sess.run(merged_summary_op)
-            summary_writer.add_summary(summary_result, global_step=n_iter)
-            start_time = time.time()
-        n_iter += 1
-#first change lv to 4e-6, then add mse loss
 
-
-
+    return 0
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "3,7"
-    gpu_num = len(os.environ["CUDA_VISIBLE_DEVICES"].split(','))
-    print("use %d gpu"%gpu_num)
-    batch_size = 4
-    record_dir = "/DATA1/03.dlnr_tfrecord/02.bm3d_label_new_D2/"
-    psf_dir = "/DATA1/dlnr_zcz/psf_32(1)/"#64*64#16*16#32*32
-    ckpt_dir = "/DATA1/dlnr_zcz/ckpt/20190618/1/"#17/1/"
-    log_dir = "/DATA1/dlnr_zcz/log/20190618/1/"#17/1/"    
-    '''
-    batch_size = 8
-    record_dir = "/DATA1/03.dlnr_tfrecord/04.bm3d_label_new_D4/"
-    psf_dir = "/DATA1/dlnr_zcz/psf/"#64*64#16*16#32*32
-    ckpt_dir = "/DATA1/dlnr_zcz/ckpt/20190524/1/"#17/1/"
-    log_dir = "/DATA1/dlnr_zcz/log/20190524/1/"#17/1/"
-    '''
-    '''
-    batch_size = 16
-    record_dir = "/DATA1/03.dlnr_tfrecord/02.bm3d_label_new_D2/"
-    psf_dir = "/DATA1/dlnr_zcz/psf_16/"#16*16#32*32
-    ckpt_dir = "/DATA1/dlnr_zcz/ckpt/20190521/2/"#17/1/"
-    log_dir = "/DATA1/dlnr_zcz/log/20190521/2/"#17/1/"
-    '''
-    record_list = glob.glob(record_dir+"*.tfrecord")
-    psf_list = glob.glob(psf_dir+"*.tfrecord")
+    test_items = ["20190703/"]
+    #test_items = ["good/"]
+    #test_items = ["test/"]
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+    src_path = '/DATA1/dlnr_zcz/test_data/'#Log_20190322_1737/'
+
+    #result_raw_path = '/DATA1/dlnr_zcz/test_data/after_registration/'
+    result_raw_path = '/DATA1/dlnr_zcz/test_data/registration/20190703/input/'
+
+    #evaluate_net(src_path, result_raw_path, gen_raw, gen_png, 1, net_dict, test_items)
+    evaluate_net_v2(src_path, result_raw_path, 1, test_items)
     
+    
+    
+    
+    
+##################    ultils_align.py######################
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
 
-    create_dir(ckpt_dir)
-    create_dir(log_dir)
-    train_1(record_list, psf_list, ckpt_dir, log_dir, batch_size=batch_size, gpu_num=gpu_num)
+import cv2
+import numpy as np
 
+def image_uint8(image):
+    if image.max() > 10:
+        return image
+    image = (image * 255).astype(np.uint8)
+    return image
+
+def align_rigid(image_set, images_gray_set, ref_ind, thre=0.05):
+    img_num = len(image_set)
+    ref_gray_image = images_gray_set[ref_ind]
+    r, c = image_set[0].shape[0:2]
+
+    identity_transform = np.eye(2, 3, dtype=np.float32)
+    warp_matrix = np.eye(2, 3, dtype=np.float32)
+    tform_set_init = [np.eye(2, 3, dtype=np.float32)] * img_num
+
+    tform_set = np.zeros_like(tform_set_init)
+    tform_inv_set = np.zeros_like(tform_set_init)
+    valid_id = []
+    motion_thre = thre * min(r, c)
+    for i in range(ref_ind - 1, -1, -1):
+        warp_matrix = cv2.estimateRigidTransform(image_uint8(ref_gray_image), 
+            image_uint8(images_gray_set[i]), fullAffine=0)
+        if warp_matrix is None:
+            continue
+        tform_set[i] = warp_matrix
+        tform_inv_set[i] = cv2.invertAffineTransform(warp_matrix)
+
+        motion_val = abs(warp_matrix - identity_transform).sum()
+        if motion_val < motion_thre:
+            valid_id.append(i)
+        else:
+            continue
+
+    warp_matrix = np.eye(2, 3, dtype=np.float32)
+    for i in range(ref_ind, img_num, 1):
+        warp_matrix = cv2.estimateRigidTransform(image_uint8(ref_gray_image), 
+            image_uint8(images_gray_set[i]), fullAffine=0)
+        if warp_matrix is None:
+            tform_set[i] = identity_transform
+            tform_inv_set[i] = identity_transform
+            continue
+        tform_set[i] = warp_matrix
+        tform_inv_set[i] = cv2.invertAffineTransform(warp_matrix)
+        motion_val = abs(warp_matrix - identity_transform).sum()
+        if motion_val < motion_thre:
+            valid_id.append(i)
+        else:
+            continue
+    return tform_set, tform_inv_set, valid_id
+
+def align_ecc(image_set, images_gray_set, ref_ind, thre=0.05):
+    img_num = len(image_set)
+    ref_gray_image = images_gray_set[ref_ind]
+    r, c = image_set[0].shape[0:2]
+
+    warp_mode = cv2.MOTION_AFFINE
+    # cv2.MOTION_HOMOGRAPHY # cv2.MOTION_AFFINE # cv2.MOTION_TRANSLATION # cv2.MOTION_EUCLIDEAN
+
+    # Define 2x3 or 3x3 matrices and initialize the matrix to identity
+    if  warp_mode == cv2.MOTION_HOMOGRAPHY:
+        print("Using homography model for alignment")
+        identity_transform = np.eye(3, 3, dtype=np.float32)
+        warp_matrix = np.eye(3, 3, dtype=np.float32)
+        tform_set_init = [np.eye(3, 3, dtype=np.float32)] * img_num
+    else:
+        identity_transform = np.eye(2, 3, dtype=np.float32)
+        warp_matrix = np.eye(2, 3, dtype=np.float32)
+        tform_set_init = [np.eye(2, 3, dtype=np.float32)] * img_num
+
+    number_of_iterations = 500
+    termination_eps = 1e-6
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations, termination_eps)
+
+    # Run the ECC algorithm. The results are stored in warp_matrix.
+    tform_set = np.zeros_like(tform_set_init)
+    tform_inv_set = np.zeros_like(tform_set_init)
+    valid_id = []
+    motion_thre = thre * min(r, c)
+    for i in range(ref_ind - 1, -1, -1):
+        _, warp_matrix = cv2.findTransformECC(ref_gray_image, images_gray_set[i], warp_matrix, warp_mode, criteria)
+        tform_set[i] = warp_matrix
+        tform_inv_set[i] = cv2.invertAffineTransform(warp_matrix)
+
+        motion_val = abs(warp_matrix - identity_transform).sum()
+        if motion_val < motion_thre:
+            valid_id.append(i)
+        else:
+            continue
+
+    if  warp_mode == cv2.MOTION_HOMOGRAPHY:
+        warp_matrix = np.eye(3, 3, dtype=np.float32)
+    else:
+        warp_matrix = np.eye(2, 3, dtype=np.float32)
+
+    for i in range(ref_ind, img_num, 1):
+        _, warp_matrix = cv2.findTransformECC(ref_gray_image, images_gray_set[i], warp_matrix, warp_mode, criteria)
+        tform_set[i] = warp_matrix
+        tform_inv_set[i] = cv2.invertAffineTransform(warp_matrix)
+
+        motion_val = abs(warp_matrix - identity_transform).sum()
+        if motion_val < motion_thre:
+            valid_id.append(i)
+        else:
+            continue
+    return tform_set, tform_inv_set, valid_id
+
+def apply_transform(image_set, tform_set, tform_inv_set, t_type, scale=1.):
+    tform_set_2 = tform_set
+    tform_inv_set_2 = tform_inv_set
+    if t_type is None:
+        if tform_set[0].shape == 2:
+            t_type = "rigid"
+        elif tform_set[0].shape == 3:
+            t_type = "homography"
+        else:
+            print("[x] Invalid transforms")
+            exit()
+
+    r, c = image_set[0].shape[0:2]
+    img_num = len(image_set)
+    image_t_set = np.zeros_like(image_set)
+    for i in range(img_num):
+        image_i = image_set[i]
+        tform_i = tform_set[i]
+        tform_i_inv = tform_inv_set[i]
+        tform_i[0,2] *= scale
+        tform_i[1,2] *= scale
+        tform_i_inv[0,2] *= scale
+        tform_i_inv[1,2] *= scale
+        tform_set_2[i] = tform_i
+        tform_inv_set_2[i] = tform_i_inv
+        if t_type != "homography":
+            image_i_transform = cv2.warpAffine(image_i, tform_i, (c, r),
+                                                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+        else:
+            image_i_transform = cv2.warpPerspective(image_i, tform_i, (c, r),
+                                                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+        image_t_set[i] = image_i_transform
+
+    return image_t_set, tform_set_2, tform_inv_set_2
+
+def sum_aligned_image(image_aligned, image_set):
+    sum_img = np.float32(image_set[0]) * 1. / len(image_aligned)
+    sum_img_t = np.float32(image_aligned[0]) * 1. / len(image_aligned)
+    identity_transform = np.eye(2, 3, dtype=np.float32)
+    r, c = image_set[0].shape[0:2]
+    for i in range(1, len(image_aligned)):
+        sum_img_t += np.float32(image_aligned[i]) * 1. / len(image_aligned)
+        image_set_i = cv2.warpAffine(image_set[i], identity_transform, (c, r),
+            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+        sum_img += np.float32(image_set_i) * 1. / len(image_aligned)
+    return sum_img_t, sum_img
+
+############################res.py######################
+"""
+res.py
+"""
+import os, time, pickle, random, time
+from datetime import datetime
+import numpy as np
+import math
+from imageio import imwrite
+import utils_align as utils_align
+
+import glob
+import cv2
+
+def create_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+def analyse_raw_name(raw_name):
+    raw_items = os.path.basename(raw_name).split("_")
+    for i in range(len(raw_items)):
+        if "ISO" == raw_items[i]:
+            iso = int(raw_items[i+1])
+    return iso
+
+def analyse_ce_raw_name(raw_name):
+    raw_items = os.path.basename(raw_name).split("_")
+    iso = int(raw_items[5])
+
+    return iso
+
+
+
+def read_vogue_raw(raw_file, size):
+    raw = np.fromfile(raw_file, dtype=np.uint16)
+    raw = raw.reshape(size)
+    
+    #raw = raw_file
+    row_num = raw.shape[0]
+    column_num = raw.shape[1]
+
+    img_b = raw[0:row_num:2, 0:column_num:2]
+    img_gb = raw[0:row_num:2, 1:column_num:2]
+    img_gr = raw[1:row_num:2, 0:column_num:2]
+    img_r = raw[1:row_num:2, 1:column_num:2]
+
+    img_test = np.stack([img_b, img_gb, img_gr, img_r], axis=-1)
+
+    img_test = img_test / 1023.
+
+    return img_test
+
+def read_simple_raw(raw_file,size):
+    raw = np.fromfile(raw_file,dtype=np.uint16)
+    raw = raw.reshape(size)
+    raw = raw / 1023.
+    return raw
+
+
+def crop_raw(raw,row,col):
+    crop = raw[150:150+row-1,150:150+col-1]
+    return crop
+
+def calc_matrix(img1, img2):
+    #first, find the sift features in images and apply the ratio test to find the best matches
+    MIN_MATCH_COUNT = 10
+    sift = cv2.xfeatures2d.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(img1,None)
+    kp2, des2 = sift.detectAndCompute(img2,None)
+    FLANN_INDEX_KDTREE = 0
+    index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
+    search_params = dict(check = 50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    matchs = flann.knnMatch(des1,des2,k=2)	
+    good = []
+    for m,n in matchs:
+    	if m.distance < 0.7*n.distance:
+    		good.append(m)
+    	
+    #extract the locations of matched keypoints in both the images, and get the 3*3 transformation matrix
+    if len(good)>MIN_MATCH_COUNT:
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
+        #return M
+    else:
+        M = np.diag(np.diag(np.ones([3,3])))
+    return M
+    
+def regis(raw,raw_tmp,shape):
+    homo = calc_matrix(raw_tmp,raw)  #we need to warp raw_tmp to the position of raw
+    raw_tmp = cv2.warpPerspective(raw_tmp,homo,shape,cv2.INTER_LINEAR,cv2.BORDER_REPLICATE)
+    return raw_tmp
+    
+#10bit
+def save_10bit_raw(input, path, size):
+    row_num = size[0]
+    column_num = size[1]
+    rst_raw = np.ndarray(shape=size, dtype=np.float32)
+    #print(rst_raw.shape)
+    rst_raw[1:row_num:2, 1:column_num:2] = input[ :, :, 3]
+    rst_raw[1:row_num:2, 0:column_num:2] = input[ :, :, 2]
+    rst_raw[0:row_num:2, 1:column_num:2] = input[ :, :, 1]
+    rst_raw[0:row_num:2, 0:column_num:2] = input[ :, :, 0]
+    rst_raw = rst_raw * 1023
+
+    rst_raw = np.where(rst_raw > 1023, 1023, rst_raw)
+    rst_raw = rst_raw.astype(np.uint16)
+    rst_raw.tofile(path)
+
+    return 0
+
+#10bit
+def save_10bit_simple(input, path, size):
+    #row_num = size[0]
+    #column_num = size[1]
+    rst_raw = np.ndarray(shape=size, dtype=np.float32)
+    rst_raw = input * 1023.
+    rst_raw = np.where(rst_raw > 1023, 1023, rst_raw)
+    rst_raw = rst_raw.astype(np.uint16)
+    rst_raw.tofile(path)
+
+    return 0
+
+
+
+def evaluate_net_v2(src_path, result_raw_path, folder_depth, test_items):
+
+    # size= (2976, 3968)
+    size = (2736, 3648)
+    #size = (3648,2736)
+    shape = (1824, 1368)
+
+    src_folder_list = []
+    dst_raw_path_list = []
+    # for depth in folder_depth_list:
+    #     tmp = sorted(glob.glob(src_path + "*/"*depth + "data_noise"))
+    #     folder_list.extend(tmp)
+
+    # test data bench mark
+    for item in test_items:
+        tmp = sorted(glob.glob(src_path + item + "*/"*folder_depth))
+        src_folder_list.extend(tmp)
+    for i in range(len(src_folder_list)):
+        dst_raw_path_list.append(result_raw_path + src_folder_list[i][len(src_path):])
+
+    reuse_flag = False
+
+    loaded = False
+    for i in range(len(src_folder_list)):
+        print(src_folder_list[i])
+        raw_files = glob.glob(src_folder_list[i] + '*.raw')
+        raw_files.sort()
+        raw_name = raw_files[0].split('/')[-1]
+        prefix = raw_name.split('_')[0]
+        
+        create_dir(dst_raw_path_list[i])
+        dst_raw_name = dst_raw_path_list[i] + prefix + '_' + raw_name[len(prefix):]
+
+        frm_num = 4
+        '''
+        orig_raw_0 = read_vogue_raw(raw_files[frm_num-1],size)
+        #print(orig_raw1.shape)
+        save_10bit_raw(orig_raw_0, dst_raw_name, size)
+        imwrite(dst_raw_path_list[i]+'_g_%d.png'% (frm_num-1), orig_raw_0[:,:,2])
+        orig_raw_0 = np.clip(orig_raw_0, 0, 1)
+        orig_raw_0 = orig_raw_0 * 255
+        orig_raw_0 = orig_raw_0.astype(np.uint8)
+        start_time = time.time()
+        
+        for f_tmp in range(0, frm_num-1):
+            orig_raw_tmp = read_vogue_raw(raw_files[f_tmp],size)
+             
+            orig_raw_tmp = np.clip(orig_raw_tmp, 0, 1)
+            orig_raw_tmp = 255*orig_raw_tmp
+            orig_raw_tmp = orig_raw_tmp.astype(np.uint8)
+            #orig_raw_tmp = regis(orig_raw_0, orig_raw_tmp1,size_3)
+            
+            homo = calc_matrix(orig_raw_0*2, orig_raw_tmp*2)  #we need to warp raw_tmp to the position of raw
+            orig_raw_tmp = cv2.warpPerspective(orig_raw_tmp, homo, shape, cv2.INTER_LINEAR, cv2.BORDER_REPLICATE)
+            
+            
+            orig_raw_tmp = orig_raw_tmp/(255.0)
+            raw_name = raw_files[f_tmp+1].split('/')[-1]
+            prefix = raw_name.split('_')[0]
+            dst_raw_name = dst_raw_path_list[i] + prefix + '_' + raw_name[len(prefix):]
+            save_10bit_raw(orig_raw_tmp, dst_raw_name, size)
+            imwrite(dst_raw_path_list[i]+'_g_%d.png'% f_tmp, orig_raw_tmp[:,:,2])
+            print(orig_raw_tmp.shape)
+
+            print("process folder:%s" % src_folder_list[i])
+            print("took: %4.4fs" % (time.time() - start_time))
+            '''
+        MOTION_MODEL = 'ECC'
+        orig_raw = []
+        orig_raw_G = []
+        for f_tmp in range(0, frm_num):
+            orig_raw_tmp = read_vogue_raw(raw_files[f_tmp],size)
+            orig_raw_tmp = 255*orig_raw_tmp
+            orig_raw_tmp = orig_raw_tmp.astype(np.uint8)
+            orig_raw.append(orig_raw_tmp)
+            orig_raw_G.append(orig_raw_tmp[:,:,1]*2)
+        print('Start alignment')
+        start_time = time.time()
+        if MOTION_MODEL == 'ECC':
+            t, t_inv, valid_id = utils_align.align_ecc(orig_raw, orig_raw_G, 0, thre=0.3)
+        elif MOTION_MODEL == 'RIGID':
+            t, t_inv, valid_id = utils_align.align_rigid(orig_raw, orig_raw_G, 0, thre=0.2)
+        print("Full alignment: %4.4f" %(time.time() - start_time))
+        
+        orig_raw = [v.astype(np.float32)/255.0 for v in orig_raw]
+        images_t, t, t_inv = utils_align.apply_transform(orig_raw, t, t_inv, MOTION_MODEL, scale=1)
+        
+        #crop
+        is_crop = False#True
+        if is_crop == True:
+            min_h, max_h, min_w, max_w = 50, size[0]//2-50, 50, size[1]//2-50
+            out_size = (2*(max_h-min_h), 2*(max_w-min_w))
+        else:
+            min_h, max_h, min_w, max_w = 0, size[0], 0, size[1]
+            out_size = size
+        ###
+        for f_tmp in range(0, frm_num):
+            img_tmp = images_t[f_tmp]
+            
+            img_tmp = img_tmp[min_h:max_h, min_w:max_w,:]
+            raw_name = raw_files[f_tmp].split('/')[-1]
+            prefix = raw_name.split('_')[0]
+            dst_raw_name = dst_raw_path_list[i] + prefix + '_' + raw_name[len(prefix):]
+            save_10bit_raw(img_tmp, dst_raw_name, out_size)
+            imwrite(dst_raw_path_list[i]+MOTION_MODEL+'_g_%d.png'% f_tmp, img_tmp[:,:,2]*2)
+        
+
+    return 0
+
+if __name__ == "__main__":
+    test_items = ["20190703/"]
+    #test_items = ["good/"]
+    #test_items = ["test/"]
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+    src_path = '/DATA1/dlnr_zcz/test_data/'#Log_20190322_1737/'
+
+    #result_raw_path = '/DATA1/dlnr_zcz/test_data/after_registration/'
+    result_raw_path = '/DATA1/dlnr_zcz/test_data/registration/20190703/input/'
+
+    #evaluate_net(src_path, result_raw_path, gen_raw, gen_png, 1, net_dict, test_items)
+    evaluate_net_v2(src_path, result_raw_path, 1, test_items)
